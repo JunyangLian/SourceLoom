@@ -1,6 +1,6 @@
 [project]
 name = "shiyuan-core"
-version = "0.4.0"
+version = "0.4.1"
 description = "拾源本地知识工作台 Knowledge Core：授权目录、L0 资产目录与文件名/路径检索"
 requires-python = ">=3.10"
 dependencies = [

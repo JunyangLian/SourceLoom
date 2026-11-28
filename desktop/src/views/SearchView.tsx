@@ -72,7 +72,7 @@ function evidenceText(query: string, items: SearchItem[]): string {
   return lines.join("\n");
 }
 
-export default function SearchView() {
+export default function SearchView({ ready = true }: { ready?: boolean }) {
   const [query, setQuery] = useState("");
   const [submitted, setSubmitted] = useState("");
   const [limit, setLimit] = useState(50);
@@ -96,6 +96,7 @@ export default function SearchView() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (!ready) return;
     let alive = true;
     api.sources()
       .then((data) => {
@@ -110,13 +111,14 @@ export default function SearchView() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [ready]);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
   useEffect(() => {
+    if (!ready) return;
     let alive = true;
     api.freshness(projectId || undefined)
       .then((data) => {
@@ -126,7 +128,7 @@ export default function SearchView() {
     return () => {
       alive = false;
     };
-  }, [projectId]);
+  }, [projectId, ready]);
 
   const activeProject = projects.find((project) => project.project_id === projectId);
   const globalSelected = activeProject?.kind === "global";

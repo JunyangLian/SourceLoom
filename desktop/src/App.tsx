@@ -40,21 +40,26 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
+    let timer: number | undefined;
+    // 核心冷启动时先快速重试，就绪后再退回 10 秒心跳；
+    // 否则首屏的数据源/项目/新鲜度请求会早于核心就绪而静默失败。
     const check = async () => {
+      let ok = false;
       try {
         const health = await api.health();
         if (!alive) return;
         setOnline(true);
         setVersion(health.version);
+        ok = true;
       } catch {
         if (alive) setOnline(false);
       }
+      if (alive) timer = window.setTimeout(check, ok ? 10000 : 2000);
     };
     void check();
-    const timer = window.setInterval(check, 10000);
     return () => {
       alive = false;
-      window.clearInterval(timer);
+      if (timer) window.clearTimeout(timer);
     };
   }, []);
 
@@ -100,7 +105,7 @@ export default function App() {
             <div className="foot-line">
               {online === null ? "连接本地核心…" : online ? "本地核心已就绪" : "本地核心未启动"}
             </div>
-            <div className="foot-sub">v{version || "0.4.0"} · 默认离线</div>
+            <div className="foot-sub">v{version || "0.4.1"} · 默认离线</div>
           </div>
         </div>
       </aside>
@@ -108,7 +113,7 @@ export default function App() {
       <main className="main" ref={mainRef}>
         {view === "search" ? (
           <div className="page">
-            <SearchView />
+            <SearchView ready={online === true} />
           </div>
         ) : view === "chat" ? (
           <ChatView />
