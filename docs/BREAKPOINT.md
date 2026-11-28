@@ -15,11 +15,11 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 297 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 322 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
-| 前端单元测试 | 18 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
+| 前端单元测试 | 21 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
 | 桌面端安装包 | 完成 | `SourceLoom_0.3.6_x64-setup.exe`（138.6MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI）；安装版数据目录为 `<安装根>\data`；解析签名 `l1.v5`；「打开原件」改走 Rust `open_original` 命令（绕开 `opener:default` 不含 `open_path` 的 ACL，关联缺失时回退「打开方式」） |

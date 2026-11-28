@@ -18,6 +18,12 @@ PATH_MATCH_LIMIT = 20000
 PATH_ONLY_LIMIT = 8
 # LIKE 兜底的候选上限：见 find_chunks 里的说明。
 LIKE_FALLBACK_LIMIT = 5000
+# 一次兜底最多扫描多少个短词：instr 是全表扫描，短词越多线性越慢
+# （20 个短词实测 12 s，1 个约 0.3 s）。多余的 2-gram 通常已被 FTS 的长片段覆盖。
+LIKE_FALLBACK_UNITS = 3
+# FTS 已有多少条候选时才跳过兜底。原来固定 100：稀有字段名（“成功识别数”）
+# 只召回二三十条也会触发 3–5 s 全表扫描，而答案通常已在这二十条里。
+FALLBACK_MIN_ROWS = 20
 
 # 这些词出现在文件夹/文件名里太常见，单独命中不足以构成证据。
 _GENERIC_PATH_TERMS = {
@@ -57,6 +63,12 @@ CODE_PENALTY = 1200
 def _file_ext(path: str) -> str:
     name = (path or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def is_numeric_term(term: str) -> bool:
+    """纯数字（可带小数点/千分位）的语义单元，例如「2022」「3.14」。"""
+    cleaned = (term or "").replace(",", "").replace(".", "").strip()
+    return bool(cleaned) and cleaned.isdigit()
 
 
 def hit_identifier_hits(hit_text: str, path: str, identifiers: list[str]) -> int:
@@ -159,17 +171,20 @@ def name_prior(path: str, analysis: dict) -> int:
 
 _SELECT = (
     "SELECT c.chunk_id, c.asset_id, c.version_id, c.text, c.page, c.sheet, c.bbox,"
+    " c.char_start, c.char_end, cv.mtime_ns AS version_mtime_ns,"
     " l.location_id, l.path, l.mtime_ns, a.parser_signature"
 )
 _JOINS = (
     " JOIN chunks c ON c.rowid = chunk_fts.rowid"
     " LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id"
+    " LEFT JOIN content_versions cv ON cv.version_id = c.version_id"
     " JOIN asset_locations l ON l.asset_id = c.asset_id"
     " JOIN sources s ON s.source_id = l.source_id"
 )
 _JOINS_NO_FTS = (
     " FROM chunks c"
     " LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id"
+    " LEFT JOIN content_versions cv ON cv.version_id = c.version_id"
     " JOIN asset_locations l ON l.asset_id = c.asset_id"
     " JOIN sources s ON s.source_id = l.source_id"
 )
@@ -224,6 +239,11 @@ class ChunkHit:
     version_id: str = ""
     mtime_ns: int = 0
     bbox: list[list[int]] | None = None
+    # 在解析后正文里的字符区间，用于前端/Agent 精确定位证据。
+    char_start: int = 0
+    char_end: int = 0
+    # 该 chunk 所属内容版本的 mtime；小于文件当前 mtime 说明索引可能过期。
+    version_mtime_ns: int = 0
     family_id: str | None = None
     family_size: int = 1
     family_title: str = ""
@@ -234,6 +254,9 @@ class ChunkHit:
     maximal: int = 0
     # 命中的语义单元按词长加权后的总分（maximal 是个数，供覆盖率计算）。
     maximal_weight: int = 0
+    # 命中的「连续短语」个数（如「土壤成分分析」「小说手稿」）。
+    # 问题里出现短语时，散落的 2-gram 命中不算证据，必须命中短语本身。
+    phrase_hits: int = 0
     # 命中的查询标识符个数（JL1/hap1/Chr41），用于区分同主题的不同样本。
     identifier_hits: int = 0
 
@@ -388,7 +411,8 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
                  source_id: str | None = None, ext: str | None = None,
                  limit: int = PATH_MATCH_LIMIT,
                  allowed_assets: set[str] | None = None,
-                 excluded_assets: set[str] | None = None) -> dict[str, PathMatch]:
+                 excluded_assets: set[str] | None = None,
+                 mtime_after_ns: int | None = None) -> dict[str, PathMatch]:
     """按完整路径召回：文件夹名 + 文件名 + 正文之外的位置信息。"""
     if allowed_assets is not None and not allowed_assets:
         return {}
@@ -410,6 +434,9 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
     if ext:
         clauses.append("l.ext = ?")
         params.append(ext.lower().lstrip("."))
+    if mtime_after_ns:
+        clauses.append("l.mtime_ns >= ?")
+        params.append(int(mtime_after_ns))
     clauses.append(
         "(" + " OR ".join("instr(lower(l.path), ?) > 0" for _ in terms) + ")"
     )
@@ -490,7 +517,8 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 path_only: bool = False,
                 allowed_assets: set[str] | None = None,
                 excluded_assets: set[str] | None = None,
-                path_index: dict[str, PathMatch] | None = None) -> list[ChunkHit]:
+                path_index: dict[str, PathMatch] | None = None,
+                mtime_after_ns: int | None = None) -> list[ChunkHit]:
     analysis = analysis or query.analyze(text)
     variants: list[str] = analysis["variants"]
     identifiers = query.query_identifiers(text)
@@ -509,11 +537,15 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
     if ext:
         where.append("l.ext = ?")
         params.append(ext.lower().lstrip("."))
+    if mtime_after_ns:
+        where.append("l.mtime_ns >= ?")
+        params.append(int(mtime_after_ns))
 
-    # 2-3 字母的 ASCII 缩写（fe/ont/rna）不能进 FTS：trigram 是子串匹配，
-    # 「ont」会把所有含 Context/front 的块都召回来。改走 LIKE + 整词边界过滤。
+    # 2 个字母的缩写（fe/ont/rna）不能进 FTS：trigram 是子串匹配，
+    # 「ont」会把所有含 Context/front 的块都召回来。3 个字母的编号（SSR/CDS）
+    # 交给 FTS，命中后再用整词边界过滤，避免它们把查询拖进全表兜底。
     def _ascii_short_unit(variant: str) -> bool:
-        return variant.isascii() and len(variant) <= 3
+        return variant.isascii() and len(variant) <= 2
 
     fts_units = [variant for variant in variants
                  if len(variant) >= 3 and not _ascii_short_unit(variant)]
@@ -530,10 +562,23 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             + " AND ".join(where) + f" ORDER BY rank LIMIT {limit}"
         )
         rows = conn.execute(sql, [*scope_params, match, *params]).fetchall()
-    if short_units:
+    if short_units and (not fts_units or len(rows) < FALLBACK_MIN_ROWS):
         # FTS5 trigram 只索引 ≥3 字符的子串；两字词（如“物种”）需要 LIKE 兜底，
         # 否则同时含长短变体的问题会漏掉短词。
-        clauses = " OR ".join("instr(lower(c.text), ?) > 0" for _ in short_units)
+        # 兜底是 instr 全表扫描（60 万 chunk，每个短词一次扫），只在**纯两字查询**或
+        # FTS 候选没填满窗口时执行；同时限制短词数量，避免长问句十几个 2-gram 线性叠加。
+        # 缩写（SSR/CDS）优先保留，它们比通用 2-gram 更有区分度。
+        ascii_units = [unit for unit in short_units
+                       if re.fullmatch(r"[a-z0-9_]{2,3}", unit)]
+        fallback_units = (ascii_units
+                          + [unit for unit in short_units if unit not in ascii_units]
+                          )[:LIKE_FALLBACK_UNITS]
+        # 中文没有大小写：直接 instr(text, ?) 即可，避免对每个短词重复 lower()
+        # 整个正文（60 万 chunk × 800 字，实测占兜底耗时的一半以上）。
+        clauses = " OR ".join(
+            "instr(lower(c.text), ?) > 0" if unit.isascii() else "instr(c.text, ?) > 0"
+            for unit in fallback_units
+        )
         order = ""
         if analysis.get("howto") or analysis.get("intro"):
             # 说明类文档的候选可能被大量数据文件挤出候选上限，优先保留它们。
@@ -549,7 +594,11 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             + " AND ".join(where + [f"({clauses})"])
             + f"{order} LIMIT {like_limit}"
         )
-        extra = conn.execute(sql, [*scope_params, *params, *short_units]).fetchall()
+        extra = conn.execute(
+            sql,
+            [*scope_params, *params,
+             *(unit.lower() if unit.isascii() else unit for unit in fallback_units)],
+        ).fetchall()
         if not fts_units:
             rows = extra
         else:
@@ -558,23 +607,20 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 merged.setdefault((row["chunk_id"], row["location_id"]), row)
             rows = list(merged.values())
 
-        # 2-3 字母缩写（FE/RE/GO/ONT/RNA）用 LIKE 会命中英文子串
-        # （fe → different、ont → Context），候选里混满无关文档。
-        # 这些短词只接受独立成词的出现，中文短词仍按子串。
-        ascii_short = [unit for unit in short_units
-                       if re.fullmatch(r"[a-z0-9_]{2,3}", unit)]
-        if ascii_short:
-            boundary = [re.compile(r"(?<![a-z0-9])" + re.escape(unit) + r"(?![a-z0-9])")
-                        for unit in ascii_short]
-            other_units = [unit for unit in variants if unit not in ascii_short]
+    ascii_short = [unit for unit in variants
+                   if re.fullmatch(r"[a-z0-9_]{2,3}", unit)]
+    if ascii_short:
+        boundary = [re.compile(r"(?<![a-z0-9])" + re.escape(unit) + r"(?![a-z0-9])")
+                    for unit in ascii_short]
+        other_units = [unit for unit in variants if unit not in ascii_short]
 
-            def row_ok(text_value: str) -> bool:
-                lowered = (text_value or "").lower()
-                if any(unit in lowered for unit in other_units):
-                    return True
-                return any(pattern.search(lowered) for pattern in boundary)
+        def row_ok(text_value: str) -> bool:
+            lowered = (text_value or "").lower()
+            if any(unit in lowered for unit in other_units):
+                return True
+            return any(pattern.search(lowered) for pattern in boundary)
 
-            rows = [row for row in rows if row_ok(row["text"])]
+        rows = [row for row in rows if row_ok(row["text"])]
 
     if allowed_assets is not None or excluded_assets:
         # 项目范围过滤放在候选召回之后：避免把 asset 集合塞进 FTS 的 WHERE，
@@ -612,6 +658,11 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             if any(variant in lowered for variant in concept["variants"])
         ]
         maximal_hit = len(matched_terms)
+        # 纯数字短语（「2022」）不能当作主题证据：它只说明年份出现过，
+        # 无答案问题（问 2022 年某赛事成绩单）会被任意含 2022 的表格误判为强命中。
+        phrase_hits = sum(
+            1 for concept in matched_terms
+            if concept.get("phrase") and not is_numeric_term(concept["term"]))
         # 语义单元按词长加权：命中「样本采集自」这样的 5 字短语远强于命中
         # 单个 2 字词，正文证据才有能力与路径命中（≤300）竞争。
         maximal_weight = sum(10 + 10 * (len(concept["term"]) - 2)
@@ -637,10 +688,14 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             version_id=row["version_id"] or "",
             mtime_ns=row["mtime_ns"] or 0,
             bbox=_parse_bbox(row["bbox"]),
+            char_start=int(row["char_start"] or 0),
+            char_end=int(row["char_end"] or 0),
+            version_mtime_ns=int(row["version_mtime_ns"] or 0),
             path_score=(path_match.score if path_match else 0)
                        + _path_only_bonus(path_match, path_only),
             maximal=maximal_hit,
             maximal_weight=maximal_weight,
+            phrase_hits=phrase_hits,
             identifier_hits=hit_identifier_hits(text_value, row["path"], identifiers),
         ))
 
@@ -665,10 +720,12 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             continue
         row = conn.execute(
             "SELECT c.chunk_id, c.version_id, c.text, c.page, c.sheet, c.bbox,"
+            " c.char_start, c.char_end, cv.mtime_ns AS version_mtime_ns,"
             " l.mtime_ns, a.parser_signature"
             " FROM chunks c"
             " JOIN asset_locations l ON l.location_id = ?"
             " LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id"
+            " LEFT JOIN content_versions cv ON cv.version_id = c.version_id"
             " WHERE c.asset_id = ? ORDER BY c.ordinal LIMIT 1",
             (match.location_id, match.asset_id),
         ).fetchone()
@@ -688,6 +745,9 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             version_id=row["version_id"] or "",
             mtime_ns=row["mtime_ns"] or 0,
             bbox=_parse_bbox(row["bbox"]),
+            char_start=int(row["char_start"] or 0),
+            char_end=int(row["char_end"] or 0),
+            version_mtime_ns=int(row["version_mtime_ns"] or 0),
             path_score=match.score + _path_only_bonus(match, path_only),
             identifier_hits=hit_identifier_hits(
                 row["text"] or "", match.path, identifiers),

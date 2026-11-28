@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   health: vi.fn(),
   stats: vi.fn(),
   sources: vi.fn(),
+  search: vi.fn(),
+  freshness: vi.fn(),
   addSource: vi.fn(),
   scan: vi.fn(),
   ocr: vi.fn(),
@@ -209,6 +211,27 @@ beforeEach(() => {
   mocks.health.mockResolvedValue({ status: "ok", version: "0.1.0", db: "test.db" });
   mocks.stats.mockResolvedValue(STATS);
   mocks.sources.mockResolvedValue({ items: [] });
+  mocks.search.mockResolvedValue({
+    query: "",
+    total: 0,
+    strong: 0,
+    items: [],
+    index_level: "L1",
+    content_hits: 0,
+    truncated: false,
+    stale: false,
+    rewritten: null,
+    vector_used: false,
+    vector_model: null,
+    vector_error: null,
+  });
+  mocks.freshness.mockResolvedValue({
+    stale: false,
+    stale_files: 0,
+    pending_jobs: 0,
+    failed_jobs: 0,
+    sources: [],
+  });
   mocks.chatSessions.mockResolvedValue({ items: [] });
   mocks.answerSettings.mockResolvedValue({
     provider: "extractive",
@@ -273,13 +296,20 @@ async function renderApp() {
   return utils;
 }
 
+async function renderChat() {
+  const utils = await renderApp();
+  fireEvent.click(screen.getByRole("button", { name: /^对话/ }));
+  await settle();
+  return utils;
+}
+
 describe("页面整合", () => {
-  it("主导航包含四个独立模块", async () => {
+  it("主导航包含检索与四个独立模块", async () => {
     const { container } = await renderApp();
     const labels = [...container.querySelectorAll(".nav .nav-label")].map(
       (element) => element.textContent,
     );
-    expect(labels).toEqual(["数据", "项目", "对话", "更新"]);
+    expect(labels).toEqual(["检索", "数据", "项目", "对话", "更新"]);
   });
 
   it("项目页展示全局项目与项目内外部接口", async () => {
@@ -292,12 +322,198 @@ describe("页面整合", () => {
     expect(await screen.findByText(/这里只读展示/)).toBeTruthy();
   });
 
-  it("默认进入对话页", async () => {
-    const { container } = await renderApp();
+  it("默认进入检索工作台", async () => {
+    await renderApp();
 
-    expect(container.querySelector(".chat-composer")).toBeTruthy();
-    expect(await screen.findByPlaceholderText("找点啥？")).toBeTruthy();
-    expect(await screen.findByText("还没有对话")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "检索" })).toBeTruthy();
+    expect(await screen.findByPlaceholderText("搜索文件名、正文或语义…")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "检索" })).toBeTruthy();
+  });
+
+  it("检索工作台提示索引落后", async () => {
+    mocks.freshness.mockResolvedValue({
+      stale: true,
+      stale_files: 3,
+      pending_jobs: 2,
+      failed_jobs: 1,
+      sources: [],
+    });
+
+    await renderApp();
+
+    expect(await screen.findByText(/索引未完全同步：3 个文件/)).toBeTruthy();
+    expect(screen.getByText(/2 个解析任务待处理/)).toBeTruthy();
+    expect(screen.getByText(/1 个任务失败/)).toBeTruthy();
+  });
+
+  it("检索工作台展示证据区间与过期标记", async () => {
+    mocks.search.mockResolvedValue({
+      query: "样本量",
+      total: 2,
+      strong: 1,
+      items: [
+        {
+          location_id: "loc_1",
+          asset_id: "ast_1",
+          name: "报告.md",
+          path: "D:\\资料\\报告.md",
+          directory: "D:\\资料",
+          rel_path: "资料/报告.md",
+          ext: "md",
+          size: 12,
+          mtime: "2026-11-22T10:00:00+08:00",
+          availability: "AVAILABLE",
+          index_level: "L1",
+          semantic: false,
+          match: "content",
+          snippet: "样本量 42",
+          page: 3,
+          sheet: null,
+          bbox: null,
+          range: { kind: "page", page: 3 },
+          stale: true,
+          source_id: "src_1",
+          source_label: "资料",
+          weak: false,
+        },
+        {
+          location_id: "loc_2",
+          asset_id: "ast_2",
+          name: "草稿.md",
+          path: "D:\\资料\\草稿.md",
+          directory: "D:\\资料",
+          rel_path: "资料/草稿.md",
+          ext: "md",
+          size: 8,
+          mtime: null,
+          availability: "AVAILABLE",
+          index_level: "L1",
+          semantic: false,
+          match: "name",
+          snippet: "样本量草稿",
+          page: null,
+          sheet: null,
+          bbox: null,
+          range: null,
+          stale: false,
+          source_id: "src_1",
+          source_label: "资料",
+          weak: true,
+        },
+      ],
+      index_level: "L1",
+      content_hits: 1,
+      truncated: false,
+      stale: true,
+      rewritten: null,
+      vector_used: true,
+      vector_model: "bge-small",
+      vector_error: null,
+    });
+
+    await renderApp();
+    fireEvent.change(screen.getByPlaceholderText("搜索文件名、正文或语义…"), {
+      target: { value: "样本量" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "检索" }));
+    await settle();
+
+    expect(await screen.findByText("报告.md")).toBeTruthy();
+    expect(screen.getByText("第 3 页")).toBeTruthy();
+    expect(screen.getByText("索引可能过期")).toBeTruthy();
+    expect(screen.getByText(/引用前请打开原文件确认/)).toBeTruthy();
+    expect(screen.getByText(/已折叠 1 条弱相关/)).toBeTruthy();
+    expect(screen.queryByText("草稿.md")).toBeNull();
+    expect(mocks.search).toHaveBeenCalledWith("样本量", {
+      limit: 50,
+      sourceId: undefined,
+      ext: undefined,
+      projectId: undefined,
+      scope: undefined,
+      mtimeDays: undefined,
+    });
+  });
+
+  it("检索工作台支持时间过滤与按需加载更多", async () => {
+    const base = {
+      index_level: "L1",
+      content_hits: 1,
+      truncated: false,
+      stale: false,
+      rewritten: null,
+      vector_used: false,
+      vector_model: null,
+      vector_error: null,
+    };
+    const first = {
+      location_id: "loc_1",
+      asset_id: "ast_1",
+      name: "报告一.md",
+      path: "D:\\资料\\报告一.md",
+      directory: "D:\\资料",
+      rel_path: "资料/报告一.md",
+      ext: "md",
+      size: 12,
+      mtime: "2026-11-22T10:00:00+08:00",
+      availability: "AVAILABLE",
+      index_level: "L1",
+      semantic: false,
+      match: "content" as const,
+      snippet: "第一段证据",
+      page: null,
+      sheet: null,
+      bbox: null,
+      range: { kind: "text" as const, startOffset: 10, endOffset: 20 },
+      stale: false,
+      source_id: "src_1",
+      source_label: "资料",
+      weak: false,
+    };
+    const second = {
+      ...first,
+      location_id: "loc_2",
+      asset_id: "ast_2",
+      name: "报告二.md",
+      path: "D:\\资料\\报告二.md",
+      rel_path: "资料/报告二.md",
+      snippet: "第二段证据",
+    };
+    mocks.search
+      .mockResolvedValueOnce({ ...base, query: "样本量", total: 2, strong: 2, items: [first] })
+      .mockResolvedValueOnce({ ...base, query: "样本量", total: 2, strong: 2, items: [second] });
+
+    await renderApp();
+    fireEvent.change(screen.getByPlaceholderText("搜索文件名、正文或语义…"), {
+      target: { value: "样本量" },
+    });
+    fireEvent.change(screen.getByLabelText("时间范围"), { target: { value: "30" } });
+    fireEvent.click(screen.getByRole("button", { name: "检索" }));
+    await settle();
+
+    expect(await screen.findByText("报告一.md")).toBeTruthy();
+    expect(screen.getByText("正文 10–20 字")).toBeTruthy();
+    expect(mocks.search).toHaveBeenLastCalledWith("样本量", {
+      limit: 50,
+      sourceId: undefined,
+      ext: undefined,
+      projectId: undefined,
+      scope: undefined,
+      mtimeDays: 30,
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /加载更多/ }));
+    await settle();
+
+    expect(await screen.findByText("报告二.md")).toBeTruthy();
+    expect(mocks.search).toHaveBeenLastCalledWith("样本量", {
+      limit: 50,
+      offset: 1,
+      sourceId: undefined,
+      ext: undefined,
+      projectId: undefined,
+      scope: undefined,
+      mtimeDays: 30,
+    });
   });
 
   it("数据页直接展示数据源", async () => {
@@ -719,7 +935,7 @@ describe("固定对话输入框", () => {
       },
     });
 
-    await renderApp();
+    await renderChat();
     fireEvent.change(await screen.findByPlaceholderText("找点啥？"), {
       target: { value: "我想看看论文写了什么" },
     });
@@ -741,7 +957,7 @@ describe("固定对话输入框", () => {
   });
 
   it("输入框与发送按钮位于消息列表之后的 composer 中", async () => {
-    const { container } = await renderApp();
+    const { container } = await renderChat();
 
     const composer = await waitFor(() => {
       const element = container.querySelector(".chat-composer");
@@ -770,7 +986,7 @@ describe("固定对话输入框", () => {
       }),
     );
 
-    const { container } = await renderApp();
+    const { container } = await renderChat();
     fireEvent.change(await screen.findByPlaceholderText("找点啥？"), {
       target: { value: "样本量是多少" },
     });
@@ -820,7 +1036,7 @@ describe("固定对话输入框", () => {
       handlers.onDelta?.("第二段");
     });
 
-    await renderApp();
+    await renderChat();
     fireEvent.change(await screen.findByPlaceholderText("找点啥？"), {
       target: { value: "样本量是多少" },
     });
@@ -836,7 +1052,7 @@ describe("固定对话输入框", () => {
   });
 
   it("切回对话时滚动到最新消息", async () => {
-    const { container } = await renderApp();
+    const { container } = await renderChat();
     const main = container.querySelector(".main") as HTMLElement;
     const setScrollTop = vi.fn();
     Object.defineProperty(main, "scrollTop", {

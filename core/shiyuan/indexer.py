@@ -165,14 +165,18 @@ def _job_update(conn: sqlite3.Connection, row: sqlite3.Row, stage: str, status: 
 
 def _requeue_failed(conn: sqlite3.Connection, stage: str, signature: str,
                     source_id: str | None = None) -> int:
-    """清理未达重试上限的失败产物，让它们在本轮重新排队。"""
+    """清理未达重试上限的失败产物，让它们在本轮重新排队。
+
+    文件被占用（locked）不是解析失败，下一轮无条件重试；失败仍受次数上限保护。
+    """
     sql = [
         "SELECT a.artifact_id FROM parse_artifacts a",
         "JOIN content_versions v ON v.version_id = a.version_id",
         "JOIN asset_locations l ON l.asset_id = v.asset_id",
         "LEFT JOIN index_jobs j ON j.version_id = a.version_id AND j.stage = ?",
-        "WHERE a.parser_signature = ? AND a.state = 'failed' AND v.is_current = 1",
-        "AND l.availability = 'AVAILABLE' AND COALESCE(j.attempts, 0) < ?",
+        "WHERE a.parser_signature = ? AND v.is_current = 1",
+        "AND l.availability = 'AVAILABLE'",
+        "AND (a.state = 'locked' OR (a.state = 'failed' AND COALESCE(j.attempts, 0) < ?))",
     ]
     params: list = [stage, signature, MAX_ATTEMPTS]
     if source_id:
@@ -337,7 +341,9 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
             if row_delay > 0:
                 time.sleep(row_delay)
         conn.commit()
-    budget.add(conn, "l1", processed)
+    if not ignore_budget:
+        # 用户显式触发的完整解析不占每日后台预算，否则大库会被 500/日卡住。
+        budget.add(conn, "l1", processed)
     if not ignore_budget and allow == 0 and pending_rows(
         conn, source_id, 1, allowed_exts=allowed_exts
     ):
@@ -679,7 +685,8 @@ def index_ocr_pending(conn: sqlite3.Connection, source_id: str | None = None,
                 time.sleep(row_delay)
         conn.commit()
 
-    budget.add(conn, "l2", processed)
+    if not ignore_budget:
+        budget.add(conn, "l2", processed)
     if not ignore_budget and allow == 0 and ocr_candidate_rows(
         conn, source_id, 1, allowed_exts=allowed_exts
     ):
@@ -786,7 +793,7 @@ def retry_job(conn: sqlite3.Connection, job_id: str) -> dict:
         state = index_version(conn, row)
     else:
         state = index_ocr_version(conn, row, engine)
-    budget.add(conn, "l1" if job["stage"] == "l1" else "l2", 1)
+    # 单文件重试是用户显式操作，不占每日后台解析预算。
     store.log_event(
         conn, "job_retry", row["source_id"],
         detail=json.dumps({"job_id": job_id, "stage": job["stage"], "state": state},

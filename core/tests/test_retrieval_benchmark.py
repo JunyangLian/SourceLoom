@@ -88,3 +88,98 @@ def test_retrieval_benchmark_recall(conn, tmp_path):
     assert recall_at_1 >= 0.80, f"R@1 退化：{recall_at_1:.3f}"
     assert mrr >= 0.80, f"MRR 退化：{mrr:.3f}"
     assert math.isfinite(mrr)
+
+
+def test_storage_bench_builds_lexical_query():
+    """存储对照脚本复用同一套查询切分：FTS5 只取 ≥3 字符，其余后端取 ≥2。"""
+    from benchmarks import storage_bench
+
+    analysis = {"variants": ["SSR", "ss", "CDS", "区域"]}
+
+    assert storage_bench._terms(analysis, minimum=2)[:2] == ["SSR", "ss"]
+    assert '"CDS"' in storage_bench._fts_query(analysis)
+    assert '"SSR"' in storage_bench._fts_query(analysis)
+    assert '"ss"' not in storage_bench._fts_query(analysis)
+
+
+def test_family_versions_count_as_hit_at_same_rank():
+    """家族归并只展示一个代表，但展开的版本仍算该名次命中。"""
+    from benchmarks import retrieval_eval
+
+    items = [{
+        "name": "论文终稿.md",
+        "path": "资料/论文终稿.md",
+        "family_versions": [
+            {"name": "论文初稿.md", "path": "资料/论文初稿.md"},
+        ],
+    }]
+
+    assert retrieval_eval._match_rank(items, ["论文初稿.md"]) == 1
+
+
+def test_agent_eval_native_search_prefers_name_hits(monkeypatch, tmp_path):
+    """A0/A1 的原生搜索：文件名命中优先，且拒绝根目录之外的路径。"""
+    from benchmarks import agent_eval
+
+    root = tmp_path / "语料"
+    root.mkdir()
+    stdout = "\n".join([
+        f"{root / '正文高频.txt'}:9",
+        f"{root / 'SSR_CDS_result.csv'}:2",
+        f"{tmp_path / 'outside.txt'}:3",
+    ])
+
+    class Done:
+        def __init__(self) -> None:
+            self.stdout = stdout
+            self.returncode = 0
+
+    monkeypatch.setattr(
+        agent_eval.subprocess, "run", lambda *args, **kwargs: Done())
+
+    found = agent_eval._native_search(["SSR", "CDS"], [root], top=5, budget_s=1)
+
+    assert Path(found["paths"][0]).name == "SSR_CDS_result.csv"
+    assert found["matched"] == 2
+    assert found["permission_violations"] == 1
+    assert found["calls"] == 1
+
+
+def test_agent_eval_sample_is_deterministic_and_unique():
+    from benchmarks import agent_eval
+
+    dataset = [{"id": f"q{index}"} for index in range(10)]
+    picked = agent_eval._sample(dataset, 4)
+
+    assert [item["id"] for item in picked] == ["q0", "q2", "q5", "q7"]
+    assert len({item["id"] for item in picked}) == len(picked)
+
+
+def test_agent_eval_topic_accumulation_compares_first_and_later():
+    from benchmarks import agent_eval
+
+    rows = [
+        {"type": "exact", "expect": ["a.md"], "passed": False,
+         "elapsed_ms": 100, "calls": 1, "output_chars": 10},
+        {"type": "exact", "expect": ["a.md"], "passed": True,
+         "elapsed_ms": 50, "calls": 1, "output_chars": 10},
+        {"type": "exact", "expect": ["b.md"], "passed": True,
+         "elapsed_ms": 30, "calls": 1, "output_chars": 10},
+    ]
+
+    result = agent_eval.topic_accumulation(rows)
+
+    assert result["groups"] == 1
+    assert result["first"]["hit_rate"] == 0.0
+    assert result["later"]["hit_rate"] == 1.0
+
+
+def test_rerank_window_parses_model_order_and_ranks():
+    from benchmarks import rerank_window
+
+    assert rerank_window._parse_order('{"order":[2,1]}', 2) == [2, 1]
+    assert rerank_window._parse_order('{"order":[{"id":2},{"id":1}]}', 2) == [2, 1]
+    assert rerank_window._parse_order("不是 JSON：3 1", 3) == [3, 1, 2]
+
+    items = [{"name": "a.md", "path": "a.md"}, {"name": "b.md", "path": "b.md"}]
+    assert rerank_window._reranked_rank(items, [2, 1], ["b.md"]) == 1

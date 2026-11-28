@@ -1,0 +1,12 @@
+# 检索评测集示例（合成标签，可入库）
+#
+# 真实问句集含个人与项目信息，放在不入库的 $SHIYUAN_HOME/evals/ 下，例如：
+#   data/evals/retrieval_seed.jsonl
+# 本文件只演示格式，标签是虚构文件名。
+#
+# 用法：
+#   cd core
+#   python -m benchmarks.retrieval_eval --dataset ../data/evals/retrieval_seed.jsonl --top 10
+{"id": "demo-01", "query": "实验记录里的样本量是多少", "type": "exact", "expect": ["实验记录.md"], "notes": "精确事实"}
+{"id": "demo-02", "query": "项目结题报告的最新版本", "type": "version", "expect": ["结题报告_v2.0.docx"], "notes": "版本追溯"}
+{"id": "demo-03", "query": "不存在的主题：量子引力实验", "type": "no_answer", "expect": [], "notes": "无答案问题"}

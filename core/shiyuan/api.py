@@ -12,6 +12,7 @@ import queue
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -121,6 +122,13 @@ async def require_api_token(request: Request, call_next):
     if supplied:
         client = await run_in_threadpool(external.authenticate, supplied)
         if client is not None:
+            # 运行时复核项目隐私：令牌创建后改成 local_only 或归档，外部入口立即关闭。
+            project_id = client.get("project_id")
+            if project_id and await run_in_threadpool(_project_closed_to_external, project_id):
+                return JSONResponse(
+                    {"detail": "该项目仅允许本地使用，外部接口已关闭"},
+                    status_code=403,
+                )
             path = request.url.path
             method = request.method.upper()
             allowed = (
@@ -173,6 +181,21 @@ def _bound_project(request: Request) -> str | None:
     """外部令牌绑定的项目；本机令牌返回 None（不限制）。"""
     client = getattr(request.state, "external_client", None)
     return (client or {}).get("project_id")
+
+
+def _project_closed_to_external(project_id: str) -> bool:
+    """项目是否已不允许外部访问（不存在 / 已归档 / local_only）。"""
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT status, privacy_policy FROM projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return True
+    return row["status"] != "active" or row["privacy_policy"] != "external_allowed"
 
 
 def _scope_request(request: Request, conn: sqlite3.Connection,
@@ -408,19 +431,32 @@ def start_ocr(source_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> d
 def run_search(request: Request, q: str = "", limit: int = 50, offset: int = 0,
                source_id: str | None = None, ext: str | None = None,
                project_id: str | None = None, scope: str | None = None,
+               mtime_days: int | None = None,
                conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     project_id, scope = _scope_request(request, conn, project_id, scope)
     requested = projects.scope_for(conn, project_id, scope)
     allowed, excluded = projects.asset_filter(conn, project_id, requested)
     priority = (projects.asset_filter(conn, project_id, "project")[0]
                 if project_id else None)
+    mtime_after_ns = (
+        time.time_ns() - max(1, min(mtime_days, 3650)) * 86_400_000_000_000
+        if mtime_days else None
+    )
     result = search.search(
         conn, q, limit=limit, offset=offset, source_id=source_id, ext=ext,
         allowed_assets=allowed, excluded_assets=excluded,
-        priority_assets=priority)
+        priority_assets=priority, mtime_after_ns=mtime_after_ns)
     result["scope"] = {"requested": requested, "used": requested,
                        "expanded": False, "project_id": project_id}
     return result
+
+
+@app.get("/api/freshness")
+def run_freshness(request: Request, project_id: str | None = None,
+                  conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """source 级索引新鲜度：文件改动、任务积压与失败。"""
+    project_id, _ = _scope_request(request, conn, project_id, None)
+    return search.index_freshness(conn, project_id=project_id)
 
 
 @app.get("/api/stats")

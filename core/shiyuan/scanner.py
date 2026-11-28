@@ -157,9 +157,11 @@ def _run_pipeline(source_id: str, force_parse: bool = False) -> None:
                         ingest.paused(conn) or not settings.get("auto_parse", True)):
                     return
                 indexer.index_pending(conn, source_id, batch=batch,
+                                      ignore_budget=force_parse,
                                       allowed_exts=allowed_exts)
                 try:
                     indexer.index_ocr_pending(conn, source_id,
+                                              ignore_budget=force_parse,
                                               allowed_exts=allowed_exts)
                 except Exception:
                     pass

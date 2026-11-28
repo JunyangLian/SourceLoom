@@ -71,6 +71,38 @@ def test_latest_version_prefers_final_over_newer_backup(conn, tmp_path):
     assert {"初稿", "终稿"} <= {version["label"] for version in item["versions"]}
 
 
+def test_latest_version_injection_is_topic_scoped(conn, tmp_path):
+    """问「手稿最新版」时不能把无关家族的最新版本注入到前面。"""
+    root = tmp_path / "版本"
+    root.mkdir()
+    for version in ("v0.1", "v0.2"):
+        (root / f"手稿_{version}.md").write_text(
+            f"褐篮子鱼手稿 {version} 的内容。", encoding="utf-8")
+    for version in ("v0.1", "v0.2", "v0.3", "v0.4", "v0.5"):
+        # 版本更多、家族更大的无关文件，旧逻辑会把它排在前面。
+        (root / f"图谱_{version}.md").write_text(
+            f"与手稿无关的图谱 {version} 内容。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+
+    result = search.search(conn, "手稿最新版本是哪个", use_vector=False)
+
+    assert result["items"][0]["name"] == "手稿_v0.2.md"
+
+
+def test_routing_preserves_version_answers(conn, tmp_path):
+    """按类型路由时，版本问题仍走家族归并与最新版注入。"""
+    _seed_versions(conn, tmp_path)
+    families.rebuild(conn)
+
+    result = search.search(conn, "论文最新的版本是哪个", use_vector=False,
+                           use_routing=True)
+
+    assert result["items"][0]["name"] == "论文终稿.md"
+
+
 def test_builds_family_without_recommendation(conn, tmp_path):
     _seed_versions(conn, tmp_path)
 

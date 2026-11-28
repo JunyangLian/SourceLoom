@@ -197,5 +197,6 @@ def test_api_jobs_and_retry(client, tmp_path):
 
     assert client.post("/api/jobs/missing/retry").status_code == 404
     stats = client.get("/api/stats").json()
-    assert stats["maintenance"]["budget"]["l1_used"] >= 2
+    # 用户显式扫描 / 单文件重试不占每日后台预算（预算只约束自动增量解析）。
+    assert stats["maintenance"]["budget"]["l1_used"] == 0
     assert "low_quality" in stats["coverage"]

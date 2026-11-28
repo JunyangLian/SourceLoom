@@ -646,7 +646,7 @@ def stats_view(conn: sqlite3.Connection, project_id: str | None) -> dict:
     """MCP / HTTP 外部接口使用的统计视图：有项目时只暴露项目范围。"""
     from . import search
 
-    base = search.stats(conn)
+    base = search.stats(conn, project_id=project_id)
     if not project_id:
         return base
     stats = project_stats(conn, project_id)

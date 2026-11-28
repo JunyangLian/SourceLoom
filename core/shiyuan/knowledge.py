@@ -141,6 +141,48 @@ def timeout() -> float:
 
 # ---------------------------------------------------------------- 内容取样
 
+def _uses_remote_model(settings: dict) -> bool:
+    """生成模型是否在远端：只有本机地址才算本地模型。"""
+    base = (settings.get("base_url") or "").lower()
+    if not base:
+        base = ("http://127.0.0.1:11434" if settings.get("provider") == "ollama"
+                else "https://api.openai.com/v1")
+    return not any(host in base for host in ("127.0.0.1", "localhost", "::1"))
+
+
+def scope_is_local_only(conn: sqlite3.Connection, scope_type: str,
+                        scope_id: str) -> bool:
+    """该知识范围是否属于 local_only 项目：属于则不得把正文送外部模型。"""
+    if scope_type == "document":
+        asset_ids = [scope_id]
+    else:
+        asset_ids = [
+            row["asset_id"] for row in conn.execute(
+                "SELECT asset_id FROM document_family_members WHERE family_id = ?",
+                (scope_id,))
+        ]
+    if not asset_ids:
+        return False
+    marks = ",".join("?" for _ in asset_ids)
+    direct = conn.execute(
+        "SELECT 1 FROM projects p JOIN project_assets pa ON pa.project_id = p.project_id"
+        " WHERE p.status = 'active' AND p.privacy_policy = 'local_only'"
+        " AND pa.status = 'active' AND pa.membership_type != 'excluded'"
+        f" AND pa.asset_id IN ({marks}) LIMIT 1",
+        asset_ids,
+    ).fetchone()
+    if direct is not None:
+        return True
+    by_source = conn.execute(
+        "SELECT 1 FROM projects p JOIN project_sources ps ON ps.project_id = p.project_id"
+        " JOIN asset_locations l ON l.source_id = ps.source_id"
+        " WHERE p.status = 'active' AND p.privacy_policy = 'local_only'"
+        f" AND l.asset_id IN ({marks}) LIMIT 1",
+        asset_ids,
+    ).fetchone()
+    return by_source is not None
+
+
 def scope_text(conn: sqlite3.Connection, scope_type: str, scope_id: str) -> str:
     """取文档/家族当前版本的正文拼接，上限 TEXT_LIMIT 字符。"""
     if scope_type == "document":
@@ -467,6 +509,13 @@ def run_round(conn_or_path) -> dict:
             if budget.remaining_knowledge(conn) <= 0:
                 counters["budget"] = 0
                 break
+            if _uses_remote_model(settings) and scope_is_local_only(
+                    conn, job["scope_type"], job["scope_id"]):
+                # local_only 项目的正文不能离开本机；跳过并记录原因，不消耗预算。
+                _finish(conn, job, "failed", settings,
+                        "该项目仅允许本地使用，已跳过外部模型生成")
+                counters["failed"] += 1
+                continue
             attempts = int(job["attempts"])
             conn.execute(
                 "UPDATE knowledge_jobs SET status = 'running', attempts = ?,"

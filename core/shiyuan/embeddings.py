@@ -830,7 +830,8 @@ def _drop_scope_tables(conn: sqlite3.Connection) -> None:
 def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | None = None,
                     ext: str | None = None, top_k: int = 30,
                     allowed_assets: set[str] | None = None,
-                    excluded_assets: set[str] | None = None) -> list[dict]:
+                    excluded_assets: set[str] | None = None,
+                    mtime_after_ns: int | None = None) -> list[dict]:
     settings = load_settings(conn)
     if not enabled(settings):
         return []
@@ -862,10 +863,14 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
     if ext:
         sql.append("AND l.ext = ?")
         params.append(ext.lower().lstrip("."))
+    if mtime_after_ns:
+        # 时间过滤必须进 SQL：全库向量缓存不区分 mtime，不能直接复用。
+        sql.append("AND l.mtime_ns >= ?")
+        params.append(int(mtime_after_ns))
 
     scoped = allowed_assets is not None or bool(excluded_assets)
     scored: list[tuple[float, float, str]] | None = None
-    if source_id is None and ext is None:
+    if source_id is None and ext is None and mtime_after_ns is None:
         cached = _cached_scores(
             conn, settings["model"], query_vector, top_k * 2,
             allowed_assets, excluded_assets)

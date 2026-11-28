@@ -270,6 +270,57 @@ def _purge_content_cache(conn: sqlite3.Connection, asset_id: str) -> None:
     )
 
 
+def _purge_asset_derived(conn: sqlite3.Connection, asset_id: str) -> None:
+    """删除资产的全部派生数据：文本缓存、向量、家族成员与文档级知识。
+
+    撤销授权与策略性排除都走这里，保证缓存与衍生知识不能绕过权限继续暴露。
+    """
+    _purge_content_cache(conn, asset_id)
+    conn.execute("DELETE FROM chunk_embeddings WHERE asset_id = ?", (asset_id,))
+    conn.execute("DELETE FROM document_family_members WHERE asset_id = ?", (asset_id,))
+    conn.execute("DELETE FROM family_content_sources WHERE asset_id = ?", (asset_id,))
+    # 文档级知识把 asset_id 存在 family_id 列里，FAQ 向量按 question_id 单独清理。
+    for question_id in [
+        row["question_id"] for row in conn.execute(
+            "SELECT question_id FROM knowledge_questions WHERE family_id = ?", (asset_id,))
+    ]:
+        conn.execute("DELETE FROM knowledge_vectors WHERE knowledge_id = ?", (question_id,))
+    for table in ("knowledge_questions", "knowledge_entities", "knowledge_relations"):
+        conn.execute(f"DELETE FROM {table} WHERE family_id = ?", (asset_id,))
+    conn.execute(
+        "DELETE FROM knowledge_summaries WHERE scope_type = 'document' AND scope_id = ?",
+        (asset_id,))
+    conn.execute(
+        "DELETE FROM knowledge_jobs WHERE scope_type = 'document' AND scope_id = ?",
+        (asset_id,))
+
+
+def _purge_empty_families(conn: sqlite3.Connection) -> None:
+    """成员已全部移除的家族连同家族级知识一起清理。"""
+    family_ids = [
+        row["family_id"] for row in conn.execute(
+            "SELECT f.family_id FROM document_families f WHERE NOT EXISTS"
+            " (SELECT 1 FROM document_family_members m WHERE m.family_id = f.family_id)")
+    ]
+    for family_id in family_ids:
+        for question_id in [
+            row["question_id"] for row in conn.execute(
+                "SELECT question_id FROM knowledge_questions WHERE family_id = ?",
+                (family_id,))
+        ]:
+            conn.execute("DELETE FROM knowledge_vectors WHERE knowledge_id = ?", (question_id,))
+        for table in ("knowledge_questions", "knowledge_entities", "knowledge_relations"):
+            conn.execute(f"DELETE FROM {table} WHERE family_id = ?", (family_id,))
+        conn.execute(
+            "DELETE FROM knowledge_summaries WHERE scope_type = 'family' AND scope_id = ?",
+            (family_id,))
+        conn.execute(
+            "DELETE FROM knowledge_jobs WHERE scope_type = 'family' AND scope_id = ?",
+            (family_id,))
+        conn.execute("DELETE FROM family_content_groups WHERE family_id = ?", (family_id,))
+        conn.execute("DELETE FROM document_families WHERE family_id = ?", (family_id,))
+
+
 def drop_locations(conn: sqlite3.Connection, location_ids: list[str]) -> int:
     """删除指定位置；资产没有其他位置时一并清掉派生缓存。
 
@@ -296,15 +347,10 @@ def drop_locations(conn: sqlite3.Connection, location_ids: list[str]) -> int:
             if remaining:
                 continue
             conn.execute("DELETE FROM project_assets WHERE asset_id = ?", (asset_id,))
-            _purge_content_cache(conn, asset_id)
-            conn.execute(
-                "DELETE FROM document_family_members WHERE asset_id = ?", (asset_id,))
-            conn.execute(
-                "DELETE FROM family_content_sources WHERE asset_id = ?", (asset_id,))
-            conn.execute(
-                "DELETE FROM chunk_embeddings WHERE asset_id = ?", (asset_id,))
+            _purge_asset_derived(conn, asset_id)
             conn.execute("DELETE FROM content_versions WHERE asset_id = ?", (asset_id,))
             conn.execute("DELETE FROM assets WHERE asset_id = ?", (asset_id,))
+        _purge_empty_families(conn)
     return len(location_ids)
 
 
@@ -328,9 +374,10 @@ def remove_source(conn: sqlite3.Connection, source_id: str) -> dict[str, int]:
             ).fetchone()[0]
             if remaining == 0:
                 conn.execute("DELETE FROM project_assets WHERE asset_id = ?", (asset_id,))
-                _purge_content_cache(conn, asset_id)
+                _purge_asset_derived(conn, asset_id)
                 conn.execute("DELETE FROM content_versions WHERE asset_id = ?", (asset_id,))
                 conn.execute("DELETE FROM assets WHERE asset_id = ?", (asset_id,))
+        _purge_empty_families(conn)
         conn.execute("DELETE FROM source_scan_runs WHERE source_id = ?", (source_id,))
         conn.execute("DELETE FROM index_jobs WHERE source_id = ?", (source_id,))
         conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))

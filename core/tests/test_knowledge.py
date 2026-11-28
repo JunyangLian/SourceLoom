@@ -66,6 +66,50 @@ def test_parse_completion_enqueues_document_summary(conn, tmp_path):
     assert job["status"] == "pending"
 
 
+def test_remove_source_purges_knowledge_and_families(conn, tmp_path):
+    """撤销授权必须连带清理向量、家族成员与衍生知识，不能留下可读缓存。"""
+    source = _source(conn, tmp_path, {"记录.md": "样本量 42 的实验已经完成。\n"})
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    asset_id = _asset_id(conn)
+    now = store.now_iso()
+
+    conn.execute(
+        "INSERT INTO document_families (family_id, title, rules_version, created_at,"
+        " updated_at) VALUES ('fam_1', '记录', 'test', ?, ?)", (now, now))
+    conn.execute(
+        "INSERT INTO document_family_members (family_id, asset_id) VALUES ('fam_1', ?)",
+        (asset_id,))
+    conn.execute(
+        "INSERT INTO family_content_groups (content_group_id, family_id, normalized_hash,"
+        " representative_text, created_at) VALUES ('cg_1', 'fam_1', 'h1', '正文', ?)", (now,))
+    conn.execute(
+        "INSERT INTO knowledge_summaries (summary_id, scope_type, scope_id, title, summary,"
+        " updated_at) VALUES ('s1', 'document', ?, 't', 's', ?)", (asset_id, now))
+    # 索引完成时已自动入队文档级摘要任务，这里只补其余类型的知识行。
+    conn.execute(
+        "INSERT INTO knowledge_entities (entity_id, family_id, name, updated_at)"
+        " VALUES ('e1', ?, '甲', ?)", (asset_id, now))
+    conn.execute(
+        "INSERT INTO knowledge_questions (question_id, family_id, question, answer, updated_at)"
+        " VALUES ('q1', ?, '问', '答', ?)", (asset_id, now))
+    conn.execute(
+        "INSERT INTO knowledge_vectors (knowledge_id, kind, model, dim, vector, updated_at)"
+        " VALUES ('q1', 'question', 'm', 2, X'0000', ?)", (now,))
+    conn.execute(
+        "INSERT INTO chunk_embeddings (chunk_id, asset_id, model, dim, vector, updated_at)"
+        " SELECT chunk_id, asset_id, 'm', 2, X'0000', ? FROM chunks LIMIT 1", (now,))
+    conn.commit()
+
+    store.remove_source(conn, source["source_id"])
+
+    for table in ("knowledge_summaries", "knowledge_jobs", "knowledge_entities",
+                  "knowledge_questions", "knowledge_vectors", "chunk_embeddings",
+                  "document_family_members", "family_content_groups",
+                  "document_families"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+
+
 def test_enqueue_resets_done_job(conn):
     knowledge.enqueue(conn, "summary", "document", "asset_x")
     conn.execute(

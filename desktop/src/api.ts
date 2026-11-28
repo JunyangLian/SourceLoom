@@ -65,6 +65,11 @@ export interface SearchItem {
   page: number | null;
   sheet: string | null;
   bbox: number[][] | null;
+  range:
+    | { kind: "page"; page: number }
+    | { kind: "text"; startOffset: number; endOffset: number }
+    | null;
+  stale: boolean;
   source_id: string;
   source_label: string;
   family_id?: string | null;
@@ -91,10 +96,29 @@ export interface SearchResponse {
   index_level: string;
   content_hits: number;
   truncated: boolean;
+  stale: boolean;
   rewritten: string | null;
   vector_used: boolean;
   vector_model: string | null;
   vector_error: string | null;
+}
+
+export interface IndexFreshness {
+  stale: boolean;
+  stale_files: number;
+  pending_jobs: number;
+  failed_jobs: number;
+  sources: {
+    source_id: string;
+    label: string;
+    state: string;
+    last_scan_at: string | null;
+    last_indexed_at: string | null;
+    stale_files: number;
+    pending_jobs: number;
+    failed_jobs: number;
+    stale: boolean;
+  }[];
 }
 
 export interface IndexJob {
@@ -924,16 +948,24 @@ export const api = {
   setState: (id: string, state: "active" | "paused") =>
     request<{ state: string }>(`/api/sources/${id}/state?state=${state}`, { method: "POST" }),
   removeSource: (id: string) => request<{ assets_cleared: number }>(`/api/sources/${id}`, { method: "DELETE" }),
-  search: (query: string, options: { limit?: number; sourceId?: string; ext?: string;
-    projectId?: string; scope?: RetrievalScope } = {}) => {
+  search: (query: string, options: { limit?: number; offset?: number; sourceId?: string;
+    ext?: string; projectId?: string; scope?: RetrievalScope; mtimeDays?: number } = {}) => {
     const params = new URLSearchParams({ q: query, limit: String(options.limit ?? 50) });
+    if (options.offset) params.set("offset", String(options.offset));
     if (options.sourceId) params.set("source_id", options.sourceId);
     if (options.ext) params.set("ext", options.ext);
     if (options.projectId) params.set("project_id", options.projectId);
     if (options.scope) params.set("scope", options.scope);
+    if (options.mtimeDays) params.set("mtime_days", String(options.mtimeDays));
     return request<SearchResponse>(`/api/search?${params.toString()}`);
   },
   stats: () => request<OverviewStats>("/api/stats"),
+  freshness: (projectId?: string) => {
+    const params = new URLSearchParams();
+    if (projectId) params.set("project_id", projectId);
+    const query = params.toString();
+    return request<IndexFreshness>(`/api/freshness${query ? `?${query}` : ""}`);
+  },
   projects: (options: { includeArchived?: boolean; externalOnly?: boolean } = {}) => {
     const params = new URLSearchParams();
     if (options.includeArchived) params.set("include_archived", "true");

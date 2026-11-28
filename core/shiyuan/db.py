@@ -453,7 +453,11 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             "text_pages": "INTEGER NOT NULL DEFAULT 0",
             "image_count": "INTEGER NOT NULL DEFAULT 0",
         },
-        "chunks": {"bbox": "TEXT"},
+        "chunks": {
+            "bbox": "TEXT",
+            "char_start": "INTEGER NOT NULL DEFAULT 0",
+            "char_end": "INTEGER NOT NULL DEFAULT 0",
+        },
         "project_sources": {"path_prefix": "TEXT NOT NULL DEFAULT ''"},
         "projects": {"kind": "TEXT NOT NULL DEFAULT 'standard'"},
         "external_clients": {"project_id": "TEXT"},

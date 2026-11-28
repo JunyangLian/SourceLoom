@@ -136,14 +136,37 @@ def _stage_of(signature: str | None) -> str:
 class MCPServer:
     """把知识库能力映射成 MCP 的 tools 与 resources。"""
 
-    def __init__(self, conn: sqlite3.Connection, project_id: str | None = None) -> None:
+    def __init__(self, conn: sqlite3.Connection, project_id: str | None = None,
+                 client_id: str | None = None) -> None:
         self.conn = conn
         # 外部令牌绑定到项目后，所有读取都必须限制在该项目范围内。
         self.bound_project_id = project_id or None
+        self.client_id = client_id
         self.bound_global = (
             projects.is_global(conn, self.bound_project_id)
             if self.bound_project_id else False
         )
+
+    def _ensure_session(self) -> None:
+        """每次调用都复核令牌与项目隐私，撤销令牌或改为 local_only 立即生效。"""
+        if not self.client_id:
+            return
+        row = self.conn.execute(
+            "SELECT state FROM external_clients WHERE client_id = ?",
+            (self.client_id,),
+        ).fetchone()
+        if row is None or row["state"] != "active":
+            raise ToolError("该外部连接已被撤销，请重新创建令牌")
+        if not self.bound_project_id:
+            return
+        project = self.conn.execute(
+            "SELECT status, privacy_policy FROM projects WHERE project_id = ?",
+            (self.bound_project_id,),
+        ).fetchone()
+        if project is None or project["status"] != "active":
+            raise ToolError("绑定项目不存在或已归档")
+        if project["privacy_policy"] != "external_allowed":
+            raise ToolError("该项目仅允许本地使用，不能通过 MCP 读取")
 
     def _bound_scope(self, project_id: str | None,
                      scope: str | None) -> tuple[str | None, str | None]:
@@ -197,6 +220,8 @@ class MCPServer:
                 return _result(message_id, self._read_resource(params))
             except _ResourceNotFound as exc:
                 return _error(message_id, -32002, str(exc))
+            except ToolError as exc:
+                return _tool_error(str(exc))
         return _error(message_id, -32601, f"Method not found: {method}")
 
     def _initialize(self, params: dict) -> dict:
@@ -248,10 +273,12 @@ class MCPServer:
                 "title": "Search knowledge base",
                 "description": (
                     "Search indexed file names, paths, parsed text and OCR content. "
-                    "Returns ranked documents with snippets and page/sheet locators. "
+                    "Returns ranked documents with snippets, page/sheet locators and an "
+                    "evidence range (page number or character offsets). "
                     "This is the recommended first step for content questions. "
                     "Results are a limited top-k sample, not the complete corpus; "
-                    "use knowledge_stats for file counts and coverage."
+                    "the response includes coverage, truncated and stale flags, and "
+                    "knowledge_stats reports file counts and coverage."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -502,7 +529,8 @@ class MCPServer:
                 "title": "Get source status",
                 "description": (
                     "Return authorized folders with scan health, availability and "
-                    "file counts. Optionally filter by source_id."
+                    "file counts, plus index freshness (changed files, pending or "
+                    "failed jobs). Optionally filter by source_id."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -519,6 +547,7 @@ class MCPServer:
             return _tool_error("无效的工具调用参数")
         started = time.monotonic()
         try:
+            self._ensure_session()
             if name == "search_knowledge":
                 payload = self._search(arguments)
             elif name == "get_document_text":
@@ -602,6 +631,8 @@ class MCPServer:
                 "mtime": item["mtime"],
                 "page": item["page"],
                 "sheet": item["sheet"],
+                "range": item.get("range"),
+                "stale": item.get("stale", False),
                 "index_level": item["index_level"],
                 "match": item["match"],
                 "semantic": item["semantic"],
@@ -627,6 +658,10 @@ class MCPServer:
             "total": result["total"],
             "returned": len(items),
             "offset": offset,
+            # 检索是排序采样而非穷尽扫描；截断时调用方应缩小范围或翻页。
+            "coverage": "ranked_sample" if not result.get("truncated") else "truncated",
+            "truncated": result.get("truncated", False),
+            "stale": result.get("stale", False),
             "rewritten": result.get("rewritten"),
             "vector_used": result.get("vector_used", False),
             "vector_error": result.get("vector_error"),
@@ -1263,7 +1298,14 @@ class MCPServer:
         items = self._list_sources()["items"]
         if source_id:
             items = [item for item in items if item["source_id"] == source_id]
-        return {"total": len(items), "items": items}
+        freshness = search.index_freshness(self.conn, self.bound_project_id)
+        if source_id:
+            freshness = {
+                **freshness,
+                "sources": [item for item in freshness["sources"]
+                            if item["source_id"] == source_id],
+            }
+        return {"total": len(items), "items": items, "freshness": freshness}
 
     # ---------------------------------------------------------------- resources
     def _resources(self) -> list[dict]:
@@ -1283,6 +1325,7 @@ class MCPServer:
         ]
 
     def _read_resource(self, params: dict) -> dict:
+        self._ensure_session()
         uri = params.get("uri")
         if uri == "shiyuan://sources":
             payload: Any = self._list_sources()
@@ -1312,9 +1355,10 @@ def serve(
     *,
     once: bool = False,
     bound_project_id: str | None = None,
+    client_id: str | None = None,
 ) -> None:
     """按行读写 JSON-RPC；stdout 只允许协议消息。"""
-    server = MCPServer(conn, project_id=bound_project_id)
+    server = MCPServer(conn, project_id=bound_project_id, client_id=client_id)
     reader = reader or _binary_stream("stdin", 0, "rb")
     writer = writer or _binary_stream("stdout", 1, "wb")
     for raw in reader:
@@ -1405,16 +1449,19 @@ def main(argv: list[str] | None = None) -> None:
 
     path = Path(args.db) if args.db else db.db_path()
     bound_project_id = None
+    client_id = None
     if token:
         client = _verify_token(path, token)
         bound_project_id = client["project_id"] or projects.GLOBAL_PROJECT_ID
+        client_id = client["client_id"]
     conn = db.connect(path)
     try:
         db.init_db(conn)
         conn.execute("PRAGMA query_only = ON")
         # 后台预热向量矩阵与本地模型，避免 Agent 的第一次检索等冷启动。
         embeddings.warm_cache_async()
-        serve(conn, once=args.once, bound_project_id=bound_project_id)
+        serve(conn, once=args.once, bound_project_id=bound_project_id,
+              client_id=client_id)
     finally:
         conn.close()
 

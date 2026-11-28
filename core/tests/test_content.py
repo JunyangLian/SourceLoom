@@ -522,3 +522,25 @@ def test_large_text_file_is_sampled_instead_of_failed(conn, tmp_path, monkeypatc
     assert report["items"][0]["status"] == "ok"
     texts = [row["text"] for row in conn.execute("SELECT text FROM chunks")]
     assert any("已截断" in text for text in texts)
+
+
+def test_locked_file_is_retried_on_next_round(conn, tmp_path, monkeypatch):
+    """文件被占用不是终态：下一轮解析应重新排队，不能永久停在 locked。"""
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "记录.md").write_text("样本量 42\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+
+    original = extractors.extract
+
+    def locked(path, ext):
+        raise PermissionError(13, "文件正被占用")
+
+    monkeypatch.setattr(extractors, "extract", locked)
+    first = indexer.index_pending(conn, source["source_id"])
+    assert first["locked"] == 1
+
+    monkeypatch.setattr(extractors, "extract", original)
+    again = indexer.index_pending(conn, source["source_id"])
+    assert again["indexed"] == 1

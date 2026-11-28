@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from shiyuan import db, indexer, mcp_server, scanner, store
+from shiyuan import db, external, indexer, mcp_server, projects, scanner, store
 from shiyuan.mcp_server import MCPServer, serve
 
 
@@ -109,6 +109,13 @@ def test_search_and_read_document(server, seeded):
     assert item["name"] == "实验记录.md"
     assert item["path"] == str(root / "实验记录.md")
     assert "NovaSeq" in item["snippet"]
+    # 统一证据接口：覆盖范围 + 字符区间。
+    assert payload["coverage"] == "ranked_sample"
+    assert payload["truncated"] is False
+    assert payload["stale"] is False
+    assert item["stale"] is False
+    assert item["range"]["kind"] == "text"
+    assert item["range"]["endOffset"] > item["range"]["startOffset"]
 
     result, document = _call(
         server, "get_document_text", {"location_id": item["location_id"]}
@@ -143,6 +150,11 @@ def test_list_sources_and_stats(server, seeded):
     _, stats = _call(server, "knowledge_stats", {})
     assert stats["files"]["available"] == 1
     assert stats["coverage"]["content_indexed"] == 1
+    assert stats["freshness"]["sources"][0]["source_id"] == source["source_id"]
+
+    _, status = _call(server, "get_source_status", {})
+    assert status["freshness"]["stale"] is False
+    assert status["freshness"]["sources"][0]["source_id"] == source["source_id"]
 
 
 def test_resources_list_and_read(server):
@@ -236,3 +248,34 @@ def test_frozen_config_uses_merged_core_exe(monkeypatch, tmp_path):
     assert server["command"].endswith("shiyuan-core.exe")
     assert server["args"] == ["--mcp"]
     assert "SHIYUAN_EXT_TOKEN" not in server["env"]
+
+
+def test_revoked_external_client_is_rejected_at_runtime(conn, seeded):
+    """令牌撤销后，已经运行中的 MCP 会话下一次调用就应被拒绝。"""
+    client = external.create_client(conn, preset="codex", transport="mcp")
+    server = MCPServer(conn, client_id=client["client_id"])
+
+    result, _ = _call(server, "list_sources", {})
+    assert result["isError"] is False
+
+    external.delete_client(conn, client["client_id"])
+    result, _ = _call(server, "list_sources", {})
+    assert result["isError"] is True
+    assert "撤销" in result["content"][0]["text"]
+
+
+def test_project_switched_to_local_only_blocks_running_mcp(conn, seeded):
+    """项目改成 local_only 后，运行中的 MCP 会话必须立即失去读取权限。"""
+    project = projects.create_project(conn, "分享项目")
+    client = external.create_client(conn, preset="codex", transport="mcp",
+                                    project_id=project["project_id"])
+    server = MCPServer(conn, project_id=project["project_id"],
+                       client_id=client["client_id"])
+
+    result, _ = _call(server, "list_sources", {})
+    assert result["isError"] is False
+
+    projects.update_project(conn, project["project_id"], privacy_policy="local_only")
+    result, _ = _call(server, "list_sources", {})
+    assert result["isError"] is True
+    assert "本地" in result["content"][0]["text"]

@@ -5,13 +5,15 @@ import ChatView from "./views/ChatView";
 import LibraryView from "./views/LibraryView";
 import HealthView from "./views/HealthView";
 import ProjectsView from "./views/ProjectsView";
+import SearchView from "./views/SearchView";
 import Icon, { type IconName } from "./Icon";
 
-type View = "chat" | "projects" | "library" | "health";
+type View = "search" | "chat" | "projects" | "library" | "health";
 
 const SIDEBAR_COLLAPSED_KEY = "shiyuan.sidebar.collapsed";
 
 const NAV: { key: View; label: string; hint: string; icon: IconName }[] = [
+  { key: "search", label: "检索", hint: "全文 · 证据定位", icon: "search" },
   { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
   { key: "projects", label: "项目", hint: "知识空间 · 外部接口", icon: "library" },
   { key: "chat", label: "对话", hint: "知识库问答", icon: "chat" },
@@ -19,7 +21,7 @@ const NAV: { key: View; label: string; hint: string; icon: IconName }[] = [
 ];
 
 export default function App() {
-  const [view, setView] = useState<View>("chat");
+  const [view, setView] = useState<View>("search");
   const [online, setOnline] = useState<boolean | null>(null);
   const [version, setVersion] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
@@ -104,7 +106,11 @@ export default function App() {
       </aside>
 
       <main className="main" ref={mainRef}>
-        {view === "chat" ? (
+        {view === "search" ? (
+          <div className="page">
+            <SearchView />
+          </div>
+        ) : view === "chat" ? (
           <ChatView />
         ) : view === "projects" ? (
           <div className="page">
